@@ -59,7 +59,7 @@ async def process_queries(request: QueryRequest, http_request: Request):
     # blpop is a "blocking" command that waits efficiently for the result.
     # We set a timeout of 10 minutes (600 seconds) for the web request.
     # On a free tier, PDF processing and indexing might take time.
-    _, result_json = redis_conn.blpop(result_key, timeout=600)
+    _, result_json = redis_conn.blpop(result_key, timeout=3600)
 
     # --- Stop the timer and print the duration ---
     end_time = time.time()

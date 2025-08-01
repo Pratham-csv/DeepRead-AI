@@ -10,10 +10,11 @@ fastapi
 uvicorn[standard]
 sentence-transformers
 openai
-pinecone-client
+pinecone
 langchain
 redis
 PyMuPDF
 python-dotenv
 requests
 tqdm
+

@@ -48,26 +48,31 @@ def mark_document_as_indexed(document_id: str):
 def get_embedding(text):
     text = text.replace("\n", " ")
     return embedding_model.encode(text).tolist()
+# In worker.py - The updated function
 def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str):
     print(f"Starting indexing: {document_id}")
     doc = fitz.open(file_path)
     full_text = "".join(page.get_text() for page in doc)
+    
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
     chunks = text_splitter.split_text(full_text)
     
-    batch_size = 100
+    batch_size = 100 
     for i in range(0, len(chunks), batch_size):
-        # --- CHECKPOINT inside a long loop ---
         if redis_conn.exists(cancel_key):
             print(f"Job canceled during indexing for {document_id}")
             raise InterruptedError(f"Job {document_id} canceled.")
             
         batch_chunks = chunks[i:i + batch_size]
-        embeddings = [get_embedding(text) for text in batch_chunks]
+        
+        # --- OPTIMIZATION: Process the entire batch at once ---
+        embeddings = embedding_model.encode(batch_chunks).tolist()
+        
         vectors_to_upsert = []
-        for j, chunk_text in enumerate(batch_chunks):
+        for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings)):
             vectors_to_upsert.append({
-                "id": f"{document_id}-chunk-{i+j}", "values": embeddings[j],
+                "id": f"{document_id}-chunk-{i+j}", 
+                "values": embedding,
                 "metadata": {"text": chunk_text, "document_id": document_id}
             })
         index.upsert(vectors=vectors_to_upsert)

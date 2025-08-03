@@ -91,7 +91,20 @@ def get_llm_answer(query, context_chunks):
         api_key=os.getenv("OPENROUTER_API_KEY"),
     )
     context = "\n\n---\n\n".join(context_chunks)
-    prompt = f"CONTEXT:\n{context}\n\nQUESTION: {query}\n\nANSWER:"
+   prompt = f"""
+    You are a precise assistant for answering questions about an insurance policy.
+    Your answer MUST be based SOLELY on the context provided below.
+    CRITICAL INSTRUCTION: When answering, you must first look for any specific exclusions, waiting periods, or limitations related to the user's question. If an exclusion clause is present, it OVERRIDES any general definition.
+    
+    FORMATTING INSTRUCTION: Provide your final answer as a single, clean paragraph. Do not use bullet points, markdown, or any special formatting.
+
+    CONTEXT:
+    {context}
+    
+    QUESTION: {query}
+    
+    ANSWER:
+    """
     response = openrouter_client.chat.completions.create(
         model=GENERATION_MODEL, messages=[{"role": "user", "content": prompt}]
     )

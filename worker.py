@@ -64,7 +64,7 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
     chunks = text_splitter.split_text(full_text)
     
-    batch_size = 500
+    batch_size = 100
     for i in range(0, len(chunks), batch_size):
         if redis_conn.exists(cancel_key):
             raise InterruptedError(f"Job {document_id} canceled during indexing.")

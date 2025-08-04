@@ -17,43 +17,37 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # --- 1. SETUP ---
 
 def initialize_services():
-    """Initializes all external services and returns client objects."""
     print("Worker starting up...")
     load_dotenv()
 
     # --- Configure API clients ---
-    print("Connecting to Redis...")
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
-        print("[FATAL] REDIS_URL is not set in environment!")
+        print("[FATAL] REDIS_URL is not set!")
         sys.exit(1)
     redis_conn = redis.from_url(redis_url)
     
-    print("Configuring OpenAI client...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
-        print("[FATAL] OPENAI_API_KEY is not set in environment!")
+        print("[FATAL] OPENAI_API_KEY is not set!")
         sys.exit(1)
     openai_client = openai.OpenAI(api_key=openai_api_key)
 
-    print("Configuring OpenRouter client...")
     openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
     if not openrouter_api_key:
-        print("[FATAL] OPENROUTER_API_KEY is not set in environment!")
+        print("[FATAL] OPENROUTER_API_KEY is not set!")
         sys.exit(1)
     openrouter_client = openai.OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=openrouter_api_key,
     )
 
-    print("Configuring Pinecone client...")
     pinecone_api_key = os.getenv("PINECONE_API_KEY")
     if not pinecone_api_key:
-        print("[FATAL] PINECONE_API_KEY is not set in environment!")
+        print("[FATAL] PINECONE_API_KEY is not set!")
         sys.exit(1)
     pc = pinecone.Pinecone(api_key=pinecone_api_key)
 
-    # --- Connect to Pinecone Index ---
     INDEX_NAME = "hackrx-index"
     EMBEDDING_DIMENSION = 1536
     
@@ -62,15 +56,15 @@ def initialize_services():
         print(f"Index '{INDEX_NAME}' not found. Creating a new one...")
         pc.create_index(
             name=INDEX_NAME, 
-            dimension=EMBEDDING_DIMENSION, 
+            dimension=EMBEDDING_DIMENSION,
             metric='cosine',
             spec=pinecone.ServerlessSpec(cloud='aws', region='us-east-1')
         )
-        print("Index created successfully. Please wait a moment for it to initialize...")
+        print("Index created. Waiting 60s to initialize...")
         import time
-        time.sleep(60) # Wait for Pinecone index to initialize
+        time.sleep(60)
 
-    print(f"Getting host for index '{INDEX_NAME}'...")
+    print(f"Retrieving Pinecone host for '{INDEX_NAME}'...")
     host = pc.describe_index(INDEX_NAME).host
     print(f"Found host: {host}")
     index = pc.Index(host=host)
@@ -94,50 +88,67 @@ def get_embeddings(texts: list[str], openai_client, dim=1536) -> list[list[float
     embeddings = []
     for idx, embedding_obj in enumerate(response.data):
         emb = embedding_obj.embedding
-        # Convert to float32 for Pinecone compatibility
         emb = np.array(emb, dtype=np.float32).tolist()
         if not is_valid_embedding(emb, dim):
             print(f"[ERROR] Embedding {idx} invalid (len={len(emb) if isinstance(emb, list) else 'N/A'}); skipped.")
             continue
+        if idx == 0:
+            print(f"[DEBUG] Sample embedding (first 5 values): {emb[:5]}")
         embeddings.append(emb)
+    print(f"[DEBUG] Generated {len(embeddings)}/{len(texts)} embeddings.")
     return embeddings
 
 def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, redis_conn, openai_client, index):
     print(f"Starting indexing: {document_id}")
     doc = fitz.open(file_path)
     full_text = "".join(page.get_text() for page in doc)
-    
+    print(f"[DEBUG] Extracted text length: {len(full_text)}")
+    print(f"[DEBUG] First 300 chars: {repr(full_text[:300])}")
+
+    if not full_text.strip():
+        print("[ERROR] Extracted PDF text is empty. Document may be scanned/image-based or encrypted.")
+        return
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
     chunks = text_splitter.split_text(full_text)
-    
+    print(f"[DEBUG] Number of text chunks: {len(chunks)}")
+    if chunks:
+        print(f"[DEBUG] First chunk: {repr(chunks[0])}")
+
     batch_size = 100
     for i in range(0, len(chunks), batch_size):
         if redis_conn.exists(cancel_key):
             raise InterruptedError(f"Job {document_id} canceled.")
         batch_chunks = chunks[i:i + batch_size]
         embeddings = get_embeddings(batch_chunks, openai_client)
-        
+        if not embeddings:
+            print("[ERROR] No embeddings were created for this batch!")
+            continue
+
         vectors_to_upsert = []
         for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings)):
             vectors_to_upsert.append({
-                "id": f"{document_id}-chunk-{i+j}", 
+                "id": f"{document_id}-chunk-{i+j}",
                 "values": embedding,
                 "metadata": {"text": chunk_text, "document_id": document_id}
             })
         if vectors_to_upsert:
+            print(f"[DEBUG] Upserting {len(vectors_to_upsert)} vectors to Pinecone.")
             index.upsert(vectors=vectors_to_upsert)
     print(f"--- ✅ Finished indexing ---")
 
 def find_most_similar_chunks(query_embedding: list[float], document_id: str, index, dim=1536, top_k: int = 5) -> list[str]:
     if not is_valid_embedding(query_embedding, dim):
-        print(f"[ERROR] Query embedding is not valid (len={len(query_embedding) if isinstance(query_embedding, list) else 'N/A'}); skipping similarity search.")
+        print(f"[ERROR] Query embedding invalid (len={len(query_embedding) if isinstance(query_embedding, list) else 'N/A'}); skipping similarity search.")
         return []
+    print(f"[DEBUG] Querying Pinecone for document_id={document_id}, embedding length={len(query_embedding)}")
     results = index.query(
         vector=query_embedding,
         top_k=top_k,
         include_metadata=True,
         filter={"document_id": {"$eq": document_id}}
     )
+    print(f"[DEBUG] Pinecone matches returned: {len(results['matches'])}")
     return [match['metadata']['text'] for match in results['matches']]
 
 def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> str:
@@ -205,6 +216,8 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
                 if redis_conn.exists(cancel_key):
                     raise InterruptedError(f"Job {job_id} canceled during processing.")
                 context_chunks = find_most_similar_chunks(query_embedding, document_id, index, dim)
+                if not context_chunks:
+                    print(f"[DEBUG] No relevant contexts found for question {i}.")
                 answer = get_llm_answer(question, context_chunks, openrouter_client) if context_chunks else "Could not find relevant information."
                 all_answers.append(answer)
 
@@ -222,7 +235,6 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
         finally:
             if temp_pdf_path and os.path.exists(temp_pdf_path):
                 os.unlink(temp_pdf_path)
-
 
 if __name__ == "__main__":
     try:

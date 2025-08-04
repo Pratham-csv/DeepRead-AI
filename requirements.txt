@@ -1,10 +1,11 @@
 fastapi
 uvicorn[standard]
 openai
-pinecone
+pinecone-client
 langchain
 redis
 PyMuPDF
 python-dotenv
 requests
 tqdm
+numpy

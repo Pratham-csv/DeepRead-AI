@@ -26,7 +26,7 @@ INDEX_NAME = "hackrx-index"
 GENERATION_MODEL = "mistralai/mistral-7b-instruct-v0.2"
 EMBEDDING_MODEL_API = "text-embedding-3-small"
 EMBEDDING_DIMENSION = 1536 # Using the correct dimension for the OpenAI model
-PROCESSED_DOCS_SET_KEY = "processed_docs_v2" # Using a new key to avoid stale data
+PROCESSED_DOCS_SET_KEY = "processed_docs_v4" # Using a new key to avoid stale data
 
 # Connect to Pinecone and create index if it doesn't exist
 print("Connecting to Pinecone index...")

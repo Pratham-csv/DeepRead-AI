@@ -1,4 +1,4 @@
-# worker.py (Corrected and Robust Version)
+# worker.py (BATCH-OPTIMIZED VERSION)
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -11,11 +11,11 @@ import redis
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import openai
-import sys # Import sys to exit gracefully on failure
+import sys
+from concurrent.futures import ThreadPoolExecutor # <-- ADDED THIS IMPORT
 
 # --- 1. SETUP ---
-# In worker.py, replace the initialize_services function with this one.
-
+# This section is unchanged.
 def initialize_services():
     """Initializes all external services and returns client objects."""
     print("Worker starting up...")
@@ -52,9 +52,8 @@ def initialize_services():
         )
         print("Index created successfully. Please wait a moment for it to initialize...")
         import time
-        time.sleep(60) # Give Pinecone a minute to initialize the new index
+        time.sleep(60)
 
-    # SOLUTION: Automatically get the host from the index description
     print(f"Getting host for index '{INDEX_NAME}'...")
     host = pc.describe_index(INDEX_NAME).host
     print(f"Found host: {host}")
@@ -65,7 +64,8 @@ def initialize_services():
     return redis_conn, openai_client, openrouter_client, index, INDEX_NAME
 
 # --- 2. HELPER FUNCTIONS ---
-# (Helper functions remain largely the same, but will now receive clients as arguments)
+# The original helper functions are unchanged.
+# We add NEW batch-specific functions.
 
 def get_embeddings(texts: list[str], openai_client) -> list[list[float]]:
     texts = [text.replace("\n", " ") for text in texts]
@@ -98,12 +98,60 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, red
         index.upsert(vectors=vectors_to_upsert)
     print(f"--- ✅ Finished indexing ---")
 
-def find_most_similar_chunks(query_embedding: list[float], document_id: str, index, top_k: int = 5) -> list[str]:
-    results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True, filter={"document_id": {"$eq": document_id}})
-    return [match['metadata']['text'] for match in results['matches']]
+# --- START: NEW BATCH HELPER FUNCTIONS ---
 
+def find_most_similar_chunks_batch(query_embeddings: list[list[float]], document_id: str, index, top_k: int = 5) -> list[list[str]]:
+    """
+    Performs a batch query to Pinecone to find context for multiple questions at once.
+    """
+    print(f"Batch querying Pinecone for {len(query_embeddings)} questions...")
+    # The pinecone client can take a list of vectors directly
+    results = index.query(
+        queries=query_embeddings, 
+        top_k=top_k, 
+        include_metadata=True, 
+        filter={"document_id": {"$eq": document_id}}
+    )
+    
+    # Process the batch results into a list of context lists
+    all_contexts = []
+    for res in results['results']:
+        context_chunks = [match['metadata']['text'] for match in res['matches']]
+        all_contexts.append(context_chunks)
+    print("--- ✅ Finished batch querying Pinecone ---")
+    return all_contexts
+
+def get_llm_answers_concurrently(questions: list[str], all_context_chunks: list[list[str]], openrouter_client) -> list[str]:
+    """
+    Calls the LLM for all questions concurrently using a thread pool.
+    """
+    print(f"Getting LLM answers for {len(questions)} questions concurrently...")
+    
+    all_answers = []
+    # We use a ThreadPoolExecutor to make all API calls at the same time
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # We prepare the arguments for each call to the original get_llm_answer function
+        job_args = []
+        for question, context_chunks in zip(questions, all_context_chunks):
+            job_args.append((question, context_chunks, openrouter_client))
+
+        # The executor.map function runs the calls in parallel
+        # We define a small lambda function to unpack the arguments for each thread
+        results_iterator = executor.map(lambda p: get_llm_answer(*p), job_args)
+        
+        # Collect results
+        all_answers = list(results_iterator)
+
+    print("--- ✅ Finished getting all LLM answers ---")
+    return all_answers
+
+# --- END: NEW BATCH HELPER FUNCTIONS ---
+
+# This is the original single-item function, now used by the concurrent helper
 def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> str:
-    # SOLUTION: This now uses the client passed as an argument, not a new one.
+    if not context_chunks:
+        return "Could not find relevant information in the document to answer this question."
+
     context = "\n\n---\n\n".join(context_chunks)
     prompt = f"""
     You are a precise assistant for answering questions about an insurance policy.
@@ -124,7 +172,8 @@ def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> 
     )
     return response.choices[0].message.content.strip()
 
-# --- 3. WORKER LOOP ---
+
+# --- 3. WORKER LOOP (MODIFIED FOR BATCHING) ---
 def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_NAME):
     PROCESSED_DOCS_SET_KEY = "processed_docs_v4"
     print(f"Worker started. Watching for jobs in Redis queue 'job_queue'...")
@@ -155,17 +204,27 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
                 process_and_index_pdf(temp_pdf_path, document_id, cancel_key, redis_conn, openai_client, index)
                 redis_conn.sadd(PROCESSED_DOCS_SET_KEY, document_id)
             
-            # SOLUTION: Get all question embeddings in one efficient batch call
+            # --- START: BATCH-OPTIMIZED LOGIC ---
+            # The FOR-LOOP is now gone. We process everything in batches.
+
+            # 1. Get all question embeddings in one API call (no change, was already optimal)
             question_embeddings = get_embeddings(questions, openai_client)
             
-            all_answers = []
-            for question, query_embedding in zip(questions, question_embeddings):
-                if redis_conn.exists(cancel_key):
-                    raise InterruptedError(f"Job {job_id} canceled during processing.")
-                
-                context_chunks = find_most_similar_chunks(query_embedding, document_id, index)
-                answer = get_llm_answer(question, context_chunks, openrouter_client) if context_chunks else "Could not find relevant information."
-                all_answers.append(answer)
+            # Check for cancellation before the next expensive step
+            if redis_conn.exists(cancel_key):
+                raise InterruptedError(f"Job {job_id} canceled after embedding.")
+            
+            # 2. Get all context chunks from Pinecone in one API call
+            all_context_chunks = find_most_similar_chunks_batch(question_embeddings, document_id, index)
+            
+            # Check for cancellation before the final expensive step
+            if redis_conn.exists(cancel_key):
+                raise InterruptedError(f"Job {job_id} canceled after context retrieval.")
+
+            # 3. Get all answers from the LLM concurrently
+            all_answers = get_llm_answers_concurrently(questions, all_context_chunks, openrouter_client)
+
+            # --- END: BATCH-OPTIMIZED LOGIC ---
 
             result_data = {"answers": all_answers}
             redis_conn.lpush(f"result:{job_id}", json.dumps(result_data))
@@ -175,6 +234,7 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
         except Exception as e:
             print(f"Error processing job {job_id}: {e}")
             if job_id:
+                # Ensure the error message is a list to match the expected AnswerResponse model
                 error_response = {"answers": [f"An error occurred: {str(e)}"]}
                 redis_conn.lpush(f"result:{job_id}", json.dumps(error_response))
                 redis_conn.expire(f"result:{job_id}", 3600)
@@ -183,12 +243,9 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
                 os.unlink(temp_pdf_path)
 
 if __name__ == "__main__":
-    # SOLUTION: Add a top-level try/except block.
-    # This will catch ANY error during initialization and print it,
-    # so you never have a silent crash again.
     try:
         redis_conn, openai_client, openrouter_client, index, INDEX_NAME = initialize_services()
         main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_NAME)
     except Exception as e:
         print(f"FATAL: Worker failed to start. Error: {e}")
-        sys.exit(1) # Exit with an error code
+        sys.exit(1)

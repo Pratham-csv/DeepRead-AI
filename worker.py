@@ -14,13 +14,14 @@ import openai
 import sys # Import sys to exit gracefully on failure
 
 # --- 1. SETUP ---
+# In worker.py, replace the initialize_services function with this one.
+
 def initialize_services():
     """Initializes all external services and returns client objects."""
     print("Worker starting up...")
     load_dotenv()
 
     # --- Configure API clients ---
-    # SOLUTION: Initialize all clients once for efficiency
     print("Connecting to Redis...")
     redis_conn = redis.from_url(os.getenv("REDIS_URL"))
     
@@ -40,20 +41,25 @@ def initialize_services():
     INDEX_NAME = "hackrx-index"
     EMBEDDING_DIMENSION = 1536
     
-    print("Checking for Pinecone index...")
+    print(f"Checking for Pinecone index '{INDEX_NAME}'...")
     if INDEX_NAME not in pc.list_indexes().names():
         print(f"Index '{INDEX_NAME}' not found. Creating a new one...")
         pc.create_index(
-            name=INDEX_NAME, dimension=EMBEDDING_DIMENSION, metric='cosine',
+            name=INDEX_NAME, 
+            dimension=EMBEDDING_DIMENSION, 
+            metric='cosine',
             spec=pinecone.ServerlessSpec(cloud='aws', region='us-east-1')
         )
+        print("Index created successfully. Please wait a moment for it to initialize...")
+        import time
+        time.sleep(60) # Give Pinecone a minute to initialize the new index
+
+    # SOLUTION: Automatically get the host from the index description
+    print(f"Getting host for index '{INDEX_NAME}'...")
+    host = pc.describe_index(INDEX_NAME).host
+    print(f"Found host: {host}")
     
-    # SOLUTION: This is the critical fix. Connect to the index using its HOST.
-    print("Connecting to Pinecone index host...")
-    pinecone_host = os.getenv("PINECONE_HOST")
-    if not pinecone_host:
-        raise ValueError("CRITICAL: PINECONE_HOST environment variable is not set.")
-    index = pc.Index(host=pinecone_host)
+    index = pc.Index(host=host)
 
     print("Worker initialization complete.")
     return redis_conn, openai_client, openrouter_client, index, INDEX_NAME

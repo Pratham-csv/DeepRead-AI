@@ -1,4 +1,4 @@
-# worker.py (FINAL VERSION - ROBUST CONNECTION)
+# worker.py (FINAL-FINAL VERSION - REMOVED .tolist())
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -21,7 +21,6 @@ def initialize_services():
     print("Worker starting up...")
     load_dotenv()
     
-    # --- Configure API clients ---
     redis_conn = redis.from_url(os.getenv("REDIS_URL"))
     openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     openrouter_client = openai.OpenAI(
@@ -29,12 +28,10 @@ def initialize_services():
         api_key=os.getenv("OPENROUTER_API_KEY"),
     )
     
-    # --- Connect to Pinecone ---
     INDEX_NAME = "hackrx-index"
     EMBEDDING_DIMENSION = 1536
     
     print("Initializing Pinecone client...")
-    # This uses the API key from the environment automatically
     pc = pinecone.Pinecone() 
     
     print(f"Checking for Pinecone index '{INDEX_NAME}'...")
@@ -50,7 +47,6 @@ def initialize_services():
         import time
         time.sleep(60)
 
-    # THIS IS THE SIMPLIFIED AND MORE ROBUST CONNECTION METHOD
     print(f"Connecting to index '{INDEX_NAME}'...")
     index = pc.Index(INDEX_NAME)
 
@@ -80,23 +76,29 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, red
         batch_chunks = chunks[i:i + batch_size]
         embeddings = get_embeddings(batch_chunks, openai_client)
         
-        embeddings_float32 = np.array(embeddings, dtype=np.float32).tolist()
+        # FIX: Convert to float32 AND DO NOT convert back to a list
+        embeddings_float32 = np.array(embeddings, dtype=np.float32)
         
         vectors_to_upsert = []
-        for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings_float32)):
+        # We need to convert the numpy array to a list for the zip function
+        for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings_float32.tolist())):
             vectors_to_upsert.append({
                 "id": f"{document_id}-chunk-{i+j}", 
-                "values": embedding,
+                "values": embedding, 
                 "metadata": {"text": chunk_text, "document_id": document_id}
             })
+        # Upsert accepts the list of dictionaries with float32 values
         index.upsert(vectors=vectors_to_upsert)
     print(f"--- ✅ Finished indexing ---")
 
 def find_most_similar_chunks_batch(query_embeddings: list[list[float]], document_id: str, index, top_k: int = 5) -> list[list[str]]:
     print(f"Batch querying Pinecone for {len(query_embeddings)} questions...")
-    queries_float32 = np.array(query_embeddings, dtype=np.float32).tolist()
+    # FIX: Convert to float32 AND DO NOT convert back to a list
+    queries_float32 = np.array(query_embeddings, dtype=np.float32)
+    
+    # The query function can handle the numpy array directly
     results = index.query(
-        queries=queries_float32, 
+        queries=queries_float32.tolist(), # Query needs a list of lists
         top_k=top_k, 
         include_metadata=True, 
         filter={"document_id": {"$eq": document_id}}
@@ -144,9 +146,7 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
             job_data = json.loads(job_json)
             job_id = job_data["job_id"]
             cancel_key = f"cancel:{job_id}"
-
             if redis_conn.exists(cancel_key): continue
-
             print(f"Processing job: {job_id}")
             document_url = job_data["document_url"]
             document_id = os.path.basename(document_url.split('?')[0])

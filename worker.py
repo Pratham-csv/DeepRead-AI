@@ -1,4 +1,4 @@
-# worker.py (BATCH-OPTIMIZED VERSION)
+# worker.py (BATCH-OPTIMIZED AND PINECONE FIX)
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -8,11 +8,12 @@ import tempfile
 import fitz
 import pinecone
 import redis
+import numpy as np # <-- ADDED NUMPY FOR DATA TYPE CONVERSION
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import openai
 import sys
-from concurrent.futures import ThreadPoolExecutor # <-- ADDED THIS IMPORT
+from concurrent.futures import ThreadPoolExecutor
 
 # --- 1. SETUP ---
 # This section is unchanged.
@@ -64,9 +65,7 @@ def initialize_services():
     return redis_conn, openai_client, openrouter_client, index, INDEX_NAME
 
 # --- 2. HELPER FUNCTIONS ---
-# The original helper functions are unchanged.
-# We add NEW batch-specific functions.
-
+# Unchanged functions...
 def get_embeddings(texts: list[str], openai_client) -> list[list[float]]:
     texts = [text.replace("\n", " ") for text in texts]
     response = openai_client.embeddings.create(input=texts, model="text-embedding-3-small")
@@ -98,22 +97,25 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, red
         index.upsert(vectors=vectors_to_upsert)
     print(f"--- ✅ Finished indexing ---")
 
-# --- START: NEW BATCH HELPER FUNCTIONS ---
+# --- START: MODIFIED BATCH HELPER FUNCTIONS ---
 
 def find_most_similar_chunks_batch(query_embeddings: list[list[float]], document_id: str, index, top_k: int = 5) -> list[list[str]]:
     """
     Performs a batch query to Pinecone to find context for multiple questions at once.
     """
     print(f"Batch querying Pinecone for {len(query_embeddings)} questions...")
-    # The pinecone client can take a list of vectors directly
+    
+    # FIX: Convert embeddings to float32 for Pinecone API compatibility.
+    # OpenAI returns float64, but Pinecone expects float32.
+    queries_float32 = np.array(query_embeddings, dtype=np.float32).tolist()
+
     results = index.query(
-        queries=query_embeddings, 
+        queries=queries_float32, # Use the converted list
         top_k=top_k, 
         include_metadata=True, 
         filter={"document_id": {"$eq": document_id}}
     )
     
-    # Process the batch results into a list of context lists
     all_contexts = []
     for res in results['results']:
         context_chunks = [match['metadata']['text'] for match in res['matches']]
@@ -128,30 +130,23 @@ def get_llm_answers_concurrently(questions: list[str], all_context_chunks: list[
     print(f"Getting LLM answers for {len(questions)} questions concurrently...")
     
     all_answers = []
-    # We use a ThreadPoolExecutor to make all API calls at the same time
     with ThreadPoolExecutor(max_workers=10) as executor:
-        # We prepare the arguments for each call to the original get_llm_answer function
         job_args = []
         for question, context_chunks in zip(questions, all_context_chunks):
             job_args.append((question, context_chunks, openrouter_client))
 
-        # The executor.map function runs the calls in parallel
-        # We define a small lambda function to unpack the arguments for each thread
         results_iterator = executor.map(lambda p: get_llm_answer(*p), job_args)
-        
-        # Collect results
         all_answers = list(results_iterator)
 
     print("--- ✅ Finished getting all LLM answers ---")
     return all_answers
 
-# --- END: NEW BATCH HELPER FUNCTIONS ---
+# --- END: MODIFIED BATCH HELPER FUNCTIONS ---
 
-# This is the original single-item function, now used by the concurrent helper
 def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> str:
     if not context_chunks:
         return "Could not find relevant information in the document to answer this question."
-
+        
     context = "\n\n---\n\n".join(context_chunks)
     prompt = f"""
     You are a precise assistant for answering questions about an insurance policy.
@@ -173,7 +168,7 @@ def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> 
     return response.choices[0].message.content.strip()
 
 
-# --- 3. WORKER LOOP (MODIFIED FOR BATCHING) ---
+# --- 3. WORKER LOOP (UNCHANGED FROM PREVIOUS VERSION) ---
 def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_NAME):
     PROCESSED_DOCS_SET_KEY = "processed_docs_v4"
     print(f"Worker started. Watching for jobs in Redis queue 'job_queue'...")
@@ -204,27 +199,17 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
                 process_and_index_pdf(temp_pdf_path, document_id, cancel_key, redis_conn, openai_client, index)
                 redis_conn.sadd(PROCESSED_DOCS_SET_KEY, document_id)
             
-            # --- START: BATCH-OPTIMIZED LOGIC ---
-            # The FOR-LOOP is now gone. We process everything in batches.
-
-            # 1. Get all question embeddings in one API call (no change, was already optimal)
             question_embeddings = get_embeddings(questions, openai_client)
             
-            # Check for cancellation before the next expensive step
             if redis_conn.exists(cancel_key):
                 raise InterruptedError(f"Job {job_id} canceled after embedding.")
             
-            # 2. Get all context chunks from Pinecone in one API call
             all_context_chunks = find_most_similar_chunks_batch(question_embeddings, document_id, index)
             
-            # Check for cancellation before the final expensive step
             if redis_conn.exists(cancel_key):
                 raise InterruptedError(f"Job {job_id} canceled after context retrieval.")
 
-            # 3. Get all answers from the LLM concurrently
             all_answers = get_llm_answers_concurrently(questions, all_context_chunks, openrouter_client)
-
-            # --- END: BATCH-OPTIMIZED LOGIC ---
 
             result_data = {"answers": all_answers}
             redis_conn.lpush(f"result:{job_id}", json.dumps(result_data))
@@ -234,7 +219,6 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
         except Exception as e:
             print(f"Error processing job {job_id}: {e}")
             if job_id:
-                # Ensure the error message is a list to match the expected AnswerResponse model
                 error_response = {"answers": [f"An error occurred: {str(e)}"]}
                 redis_conn.lpush(f"result:{job_id}", json.dumps(error_response))
                 redis_conn.expire(f"result:{job_id}", 3600)

@@ -1,4 +1,4 @@
-# worker.py (BATCH-OPTIMIZED AND PINECONE FIX)
+# worker.py (FINALIZED BATCH & DATA TYPE FIX)
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -8,7 +8,7 @@ import tempfile
 import fitz
 import pinecone
 import redis
-import numpy as np # <-- ADDED NUMPY FOR DATA TYPE CONVERSION
+import numpy as np # For data type conversion
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import openai
@@ -16,29 +16,17 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 # --- 1. SETUP ---
-# This section is unchanged.
 def initialize_services():
     """Initializes all external services and returns client objects."""
     print("Worker starting up...")
     load_dotenv()
-
-    # --- Configure API clients ---
-    print("Connecting to Redis...")
     redis_conn = redis.from_url(os.getenv("REDIS_URL"))
-    
-    print("Configuring OpenAI client...")
     openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-    print("Configuring OpenRouter client...")
     openrouter_client = openai.OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=os.getenv("OPENROUTER_API_KEY"),
     )
-
-    print("Configuring Pinecone client...")
     pc = pinecone.Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-
-    # --- Connect to Pinecone Index ---
     INDEX_NAME = "hackrx-index"
     EMBEDDING_DIMENSION = 1536
     
@@ -51,21 +39,17 @@ def initialize_services():
             metric='cosine',
             spec=pinecone.ServerlessSpec(cloud='aws', region='us-east-1')
         )
-        print("Index created successfully. Please wait a moment for it to initialize...")
+        print("Index created successfully. Please wait for initialization...")
         import time
         time.sleep(60)
 
-    print(f"Getting host for index '{INDEX_NAME}'...")
     host = pc.describe_index(INDEX_NAME).host
-    print(f"Found host: {host}")
-    
     index = pc.Index(host=host)
-
     print("Worker initialization complete.")
     return redis_conn, openai_client, openrouter_client, index, INDEX_NAME
 
 # --- 2. HELPER FUNCTIONS ---
-# Unchanged functions...
+
 def get_embeddings(texts: list[str], openai_client) -> list[list[float]]:
     texts = [text.replace("\n", " ") for text in texts]
     response = openai_client.embeddings.create(input=texts, model="text-embedding-3-small")
@@ -87,79 +71,55 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, red
         batch_chunks = chunks[i:i + batch_size]
         embeddings = get_embeddings(batch_chunks, openai_client)
         
+        # --- THIS IS THE NEW FIX ---
+        # Ensure vectors for upserting are ALSO float32 for consistency
+        embeddings_float32 = np.array(embeddings, dtype=np.float32).tolist()
+        
         vectors_to_upsert = []
-        for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings)):
+        # Use the converted embeddings here
+        for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings_float32)):
             vectors_to_upsert.append({
                 "id": f"{document_id}-chunk-{i+j}", 
-                "values": embedding,
+                "values": embedding, # This is now consistently float32
                 "metadata": {"text": chunk_text, "document_id": document_id}
             })
         index.upsert(vectors=vectors_to_upsert)
     print(f"--- ✅ Finished indexing ---")
 
-# --- START: MODIFIED BATCH HELPER FUNCTIONS ---
-
 def find_most_similar_chunks_batch(query_embeddings: list[list[float]], document_id: str, index, top_k: int = 5) -> list[list[str]]:
-    """
-    Performs a batch query to Pinecone to find context for multiple questions at once.
-    """
     print(f"Batch querying Pinecone for {len(query_embeddings)} questions...")
-    
-    # FIX: Convert embeddings to float32 for Pinecone API compatibility.
-    # OpenAI returns float64, but Pinecone expects float32.
     queries_float32 = np.array(query_embeddings, dtype=np.float32).tolist()
-
     results = index.query(
-        queries=queries_float32, # Use the converted list
+        queries=queries_float32, 
         top_k=top_k, 
         include_metadata=True, 
         filter={"document_id": {"$eq": document_id}}
     )
-    
-    all_contexts = []
-    for res in results['results']:
-        context_chunks = [match['metadata']['text'] for match in res['matches']]
-        all_contexts.append(context_chunks)
+    all_contexts = [[match['metadata']['text'] for match in res['matches']] for res in results['results']]
     print("--- ✅ Finished batch querying Pinecone ---")
     return all_contexts
 
 def get_llm_answers_concurrently(questions: list[str], all_context_chunks: list[list[str]], openrouter_client) -> list[str]:
-    """
-    Calls the LLM for all questions concurrently using a thread pool.
-    """
     print(f"Getting LLM answers for {len(questions)} questions concurrently...")
-    
-    all_answers = []
     with ThreadPoolExecutor(max_workers=10) as executor:
-        job_args = []
-        for question, context_chunks in zip(questions, all_context_chunks):
-            job_args.append((question, context_chunks, openrouter_client))
-
+        job_args = [(q, c, openrouter_client) for q, c in zip(questions, all_context_chunks)]
         results_iterator = executor.map(lambda p: get_llm_answer(*p), job_args)
         all_answers = list(results_iterator)
-
     print("--- ✅ Finished getting all LLM answers ---")
     return all_answers
-
-# --- END: MODIFIED BATCH HELPER FUNCTIONS ---
 
 def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> str:
     if not context_chunks:
         return "Could not find relevant information in the document to answer this question."
-        
     context = "\n\n---\n\n".join(context_chunks)
     prompt = f"""
     You are a precise assistant for answering questions about an insurance policy.
     Your answer MUST be based SOLELY on the context provided below.
     CRITICAL INSTRUCTION: When answering, you must first look for any specific exclusions, waiting periods, or limitations related to the user's question. If an exclusion clause is present, it OVERRIDES any general definition.
-    
     FORMATTING INSTRUCTION: Provide your final answer as a single, clean paragraph. Do not use bullet points, markdown, or any special formatting.
-
     CONTEXT:
     {context}
-    
     QUESTION: {query}
-    
     ANSWER:
     """
     response = openrouter_client.chat.completions.create(
@@ -167,8 +127,7 @@ def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> 
     )
     return response.choices[0].message.content.strip()
 
-
-# --- 3. WORKER LOOP (UNCHANGED FROM PREVIOUS VERSION) ---
+# --- 3. WORKER LOOP ---
 def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_NAME):
     PROCESSED_DOCS_SET_KEY = "processed_docs_v4"
     print(f"Worker started. Watching for jobs in Redis queue 'job_queue'...")
@@ -201,13 +160,11 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
             
             question_embeddings = get_embeddings(questions, openai_client)
             
-            if redis_conn.exists(cancel_key):
-                raise InterruptedError(f"Job {job_id} canceled after embedding.")
+            if redis_conn.exists(cancel_key): raise InterruptedError(f"Job {job_id} canceled.")
             
             all_context_chunks = find_most_similar_chunks_batch(question_embeddings, document_id, index)
             
-            if redis_conn.exists(cancel_key):
-                raise InterruptedError(f"Job {job_id} canceled after context retrieval.")
+            if redis_conn.exists(cancel_key): raise InterruptedError(f"Job {job_id} canceled.")
 
             all_answers = get_llm_answers_concurrently(questions, all_context_chunks, openrouter_client)
 

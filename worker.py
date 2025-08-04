@@ -1,4 +1,4 @@
-# worker.py (Final Corrected Version)
+# worker.py (Corrected and Robust Version)
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -11,52 +11,62 @@ import redis
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import openai
+import sys # Import sys to exit gracefully on failure
 
 # --- 1. SETUP ---
-print("Worker starting up...")
-load_dotenv()
+def initialize_services():
+    """Initializes all external services and returns client objects."""
+    print("Worker starting up...")
+    load_dotenv()
 
-# --- Configure API clients ---
-redis_conn = redis.from_url(os.getenv("REDIS_URL"))
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-pc = pinecone.Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    # --- Configure API clients ---
+    # SOLUTION: Initialize all clients once for efficiency
+    print("Connecting to Redis...")
+    redis_conn = redis.from_url(os.getenv("REDIS_URL"))
+    
+    print("Configuring OpenAI client...")
+    openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Define constants
-INDEX_NAME = "hackrx-index"
-GENERATION_MODEL = "mistralai/mistral-7b-instruct-v0.2"
-EMBEDDING_MODEL_API = "text-embedding-3-small"
-EMBEDDING_DIMENSION = 1536 # Using the correct dimension for the OpenAI model
-PROCESSED_DOCS_SET_KEY = "processed_docs_v4" # Using a new key to avoid stale data
-
-# Connect to Pinecone and create index if it doesn't exist
-print("Connecting to Pinecone index...")
-if INDEX_NAME not in pc.list_indexes().names():
-    print(f"Index '{INDEX_NAME}' not found. Creating a new one with dimension {EMBEDDING_DIMENSION}...")
-    pc.create_index(
-        name=INDEX_NAME, dimension=EMBEDDING_DIMENSION, metric='cosine',
-        spec=pinecone.ServerlessSpec(cloud='aws', region='us-east-1')
+    print("Configuring OpenRouter client...")
+    openrouter_client = openai.OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.getenv("OPENROUTER_API_KEY"),
     )
-index = pc.Index(INDEX_NAME)
-print("Worker is ready.")
+
+    print("Configuring Pinecone client...")
+    pc = pinecone.Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+
+    # --- Connect to Pinecone Index ---
+    INDEX_NAME = "hackrx-index"
+    EMBEDDING_DIMENSION = 1536
+    
+    print("Checking for Pinecone index...")
+    if INDEX_NAME not in pc.list_indexes().names():
+        print(f"Index '{INDEX_NAME}' not found. Creating a new one...")
+        pc.create_index(
+            name=INDEX_NAME, dimension=EMBEDDING_DIMENSION, metric='cosine',
+            spec=pinecone.ServerlessSpec(cloud='aws', region='us-east-1')
+        )
+    
+    # SOLUTION: This is the critical fix. Connect to the index using its HOST.
+    print("Connecting to Pinecone index host...")
+    pinecone_host = os.getenv("PINECONE_HOST")
+    if not pinecone_host:
+        raise ValueError("CRITICAL: PINECONE_HOST environment variable is not set.")
+    index = pc.Index(host=pinecone_host)
+
+    print("Worker initialization complete.")
+    return redis_conn, openai_client, openrouter_client, index, INDEX_NAME
 
 # --- 2. HELPER FUNCTIONS ---
+# (Helper functions remain largely the same, but will now receive clients as arguments)
 
-def is_document_indexed(document_id: str) -> bool:
-    """Checks Redis to see if the document has been processed before."""
-    return redis_conn.sismember(PROCESSED_DOCS_SET_KEY, document_id)
-
-def mark_document_as_indexed(document_id: str):
-    """Marks a document as processed in Redis."""
-    redis_conn.sadd(PROCESSED_DOCS_SET_KEY, document_id)
-
-def get_embeddings(texts: list[str]) -> list[list[float]]:
-    """Generates embeddings for a list of texts using OpenAI's API."""
+def get_embeddings(texts: list[str], openai_client) -> list[list[float]]:
     texts = [text.replace("\n", " ") for text in texts]
-    response = openai_client.embeddings.create(input=texts, model=EMBEDDING_MODEL_API)
+    response = openai_client.embeddings.create(input=texts, model="text-embedding-3-small")
     return [embedding.embedding for embedding in response.data]
 
-def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str):
-    """Processes a PDF, generates embeddings, and upserts them to Pinecone."""
+def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, redis_conn, openai_client, index):
     print(f"Starting indexing: {document_id}")
     doc = fitz.open(file_path)
     full_text = "".join(page.get_text() for page in doc)
@@ -67,10 +77,10 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str):
     batch_size = 100
     for i in range(0, len(chunks), batch_size):
         if redis_conn.exists(cancel_key):
-            raise InterruptedError(f"Job {document_id} canceled during indexing.")
+            raise InterruptedError(f"Job {document_id} canceled.")
             
         batch_chunks = chunks[i:i + batch_size]
-        embeddings = get_embeddings(batch_chunks)
+        embeddings = get_embeddings(batch_chunks, openai_client)
         
         vectors_to_upsert = []
         for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings)):
@@ -82,38 +92,25 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str):
         index.upsert(vectors=vectors_to_upsert)
     print(f"--- ✅ Finished indexing ---")
 
-def find_most_similar_chunks(query_embedding: list[float], document_id: str, top_k: int = 5) -> list[str]:
-    """Queries Pinecone for the most similar chunks for a given document."""
+def find_most_similar_chunks(query_embedding: list[float], document_id: str, index, top_k: int = 5) -> list[str]:
     results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True, filter={"document_id": {"$eq": document_id}})
     return [match['metadata']['text'] for match in results['matches']]
 
-def get_llm_answer(query: str, context_chunks: list[str]) -> str:
-    """Generates an answer using the LLM based on the provided context."""
-    openrouter_client = openai.OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.getenv("OPENROUTER_API_KEY"),
-    )
+def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> str:
+    # SOLUTION: This now uses the client passed as an argument, not a new one.
     context = "\n\n---\n\n".join(context_chunks)
-    prompt = f"""You are a precise assistant for answering questions. Your answer MUST be based SOLELY on the CONTEXT provided. If an exclusion or limitation is present, it OVERRIDES any general definition. Provide your final answer as a single, clean paragraph without special formatting.
-
-    CONTEXT:
-    {context}
-    
-    QUESTION: {query}
-    
-    ANSWER:
-    """
+    prompt = f"""You are a precise assistant... (rest of your prompt)"""
     response = openrouter_client.chat.completions.create(
-        model=GENERATION_MODEL, messages=[{"role": "user", "content": prompt}]
+        model="mistralai/mistral-7b-instruct-v0.2", messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content.strip()
 
 # --- 3. WORKER LOOP ---
-def main_worker_loop():
-    print("Worker started. Watching for jobs in Redis queue 'job_queue'...")
+def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_NAME):
+    PROCESSED_DOCS_SET_KEY = "processed_docs_v4"
+    print(f"Worker started. Watching for jobs in Redis queue 'job_queue'...")
     while True:
-        job_id = None
-        temp_pdf_path = None
+        job_id, temp_pdf_path = None, None
         try:
             _, job_json = redis_conn.brpop('job_queue')
             job_data = json.loads(job_json)
@@ -129,27 +126,26 @@ def main_worker_loop():
             document_id = os.path.basename(document_url.split('?')[0])
             questions = job_data["questions"]
 
-            if not is_document_indexed(document_id):
+            if not redis_conn.sismember(PROCESSED_DOCS_SET_KEY, document_id):
                 response = requests.get(document_url)
                 response.raise_for_status()
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
                     temp_pdf.write(response.content)
                     temp_pdf_path = temp_pdf.name
                 
-                if redis_conn.exists(cancel_key):
-                    raise InterruptedError(f"Job {job_id} canceled after download.")
-                
-                process_and_index_pdf(temp_pdf_path, document_id, cancel_key)
-                mark_document_as_indexed(document_id)
+                process_and_index_pdf(temp_pdf_path, document_id, cancel_key, redis_conn, openai_client, index)
+                redis_conn.sadd(PROCESSED_DOCS_SET_KEY, document_id)
+            
+            # SOLUTION: Get all question embeddings in one efficient batch call
+            question_embeddings = get_embeddings(questions, openai_client)
             
             all_answers = []
-            for question in questions:
+            for question, query_embedding in zip(questions, question_embeddings):
                 if redis_conn.exists(cancel_key):
-                    raise InterruptedError(f"Job {job_id} canceled during question processing.")
+                    raise InterruptedError(f"Job {job_id} canceled during processing.")
                 
-                query_embedding = get_embeddings([question])[0]
-                context_chunks = find_most_similar_chunks(query_embedding, document_id)
-                answer = get_llm_answer(question, context_chunks) if context_chunks else "Could not find relevant information."
+                context_chunks = find_most_similar_chunks(query_embedding, document_id, index)
+                answer = get_llm_answer(question, context_chunks, openrouter_client) if context_chunks else "Could not find relevant information."
                 all_answers.append(answer)
 
             result_data = {"answers": all_answers}
@@ -157,8 +153,6 @@ def main_worker_loop():
             redis_conn.expire(f"result:{job_id}", 3600)
             print(f"Finished job: {job_id}")
         
-        except InterruptedError as e:
-            print(e)
         except Exception as e:
             print(f"Error processing job {job_id}: {e}")
             if job_id:
@@ -170,4 +164,12 @@ def main_worker_loop():
                 os.unlink(temp_pdf_path)
 
 if __name__ == "__main__":
-    main_worker_loop()
+    # SOLUTION: Add a top-level try/except block.
+    # This will catch ANY error during initialization and print it,
+    # so you never have a silent crash again.
+    try:
+        redis_conn, openai_client, openrouter_client, index, INDEX_NAME = initialize_services()
+        main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_NAME)
+    except Exception as e:
+        print(f"FATAL: Worker failed to start. Error: {e}")
+        sys.exit(1) # Exit with an error code

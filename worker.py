@@ -20,7 +20,6 @@ def initialize_services():
     print("Worker starting up...")
     load_dotenv()
 
-    # --- Configure API clients ---
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
         print("[FATAL] REDIS_URL is not set!")
@@ -133,7 +132,9 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, red
                 "metadata": {"text": chunk_text, "document_id": document_id}
             })
         if vectors_to_upsert:
-            print(f"[DEBUG] Upserting {len(vectors_to_upsert)} vectors to Pinecone.")
+            print(f"[DEBUG] Upserting {len(vectors_to_upsert)} vectors with document_id: {document_id}")
+            for v in vectors_to_upsert[:3]:  # print sample up to 3 vectors
+                print(f"  Vector ID: {v['id']}, document_id metadata: {v['metadata']['document_id']}")
             index.upsert(vectors=vectors_to_upsert)
     print(f"--- ✅ Finished indexing ---")
 
@@ -142,14 +143,29 @@ def find_most_similar_chunks(query_embedding: list[float], document_id: str, ind
         print(f"[ERROR] Query embedding invalid (len={len(query_embedding) if isinstance(query_embedding, list) else 'N/A'}); skipping similarity search.")
         return []
     print(f"[DEBUG] Querying Pinecone for document_id={document_id}, embedding length={len(query_embedding)}")
-    results = index.query(
+
+    # Try querying WITH filter
+    results_with_filter = index.query(
         vector=query_embedding,
         top_k=top_k,
         include_metadata=True,
         filter={"document_id": {"$eq": document_id}}
     )
-    print(f"[DEBUG] Pinecone matches returned: {len(results['matches'])}")
-    return [match['metadata']['text'] for match in results['matches']]
+    print(f"[DEBUG] Pinecone matches returned with filter: {len(results_with_filter['matches'])}")
+
+    if len(results_with_filter['matches']) > 0:
+        return [match['metadata']['text'] for match in results_with_filter['matches']]
+
+    # If no matches, try AGAIN without filter for diagnostics
+    print("[DEBUG] No matches with filter; querying without filter for diagnostics...")
+    results_without_filter = index.query(
+        vector=query_embedding,
+        top_k=top_k,
+        include_metadata=True,
+    )
+    print(f"[DEBUG] Pinecone matches returned without filter: {len(results_without_filter['matches'])}")
+
+    return [match['metadata']['text'] for match in results_without_filter['matches']]
 
 def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> str:
     context = "\n\n---\n\n".join(context_chunks)

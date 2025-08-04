@@ -1,4 +1,4 @@
-# worker.py (FINALIZED BATCH & DATA TYPE FIX)
+# worker.py (FINAL VERSION - ROBUST CONNECTION)
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -8,7 +8,7 @@ import tempfile
 import fitz
 import pinecone
 import redis
-import numpy as np # For data type conversion
+import numpy as np
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import openai
@@ -20,15 +20,22 @@ def initialize_services():
     """Initializes all external services and returns client objects."""
     print("Worker starting up...")
     load_dotenv()
+    
+    # --- Configure API clients ---
     redis_conn = redis.from_url(os.getenv("REDIS_URL"))
     openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     openrouter_client = openai.OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=os.getenv("OPENROUTER_API_KEY"),
     )
-    pc = pinecone.Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    
+    # --- Connect to Pinecone ---
     INDEX_NAME = "hackrx-index"
     EMBEDDING_DIMENSION = 1536
+    
+    print("Initializing Pinecone client...")
+    # This uses the API key from the environment automatically
+    pc = pinecone.Pinecone() 
     
     print(f"Checking for Pinecone index '{INDEX_NAME}'...")
     if INDEX_NAME not in pc.list_indexes().names():
@@ -43,9 +50,11 @@ def initialize_services():
         import time
         time.sleep(60)
 
-    host = pc.describe_index(INDEX_NAME).host
-    index = pc.Index(host=host)
-    print("Worker initialization complete.")
+    # THIS IS THE SIMPLIFIED AND MORE ROBUST CONNECTION METHOD
+    print(f"Connecting to index '{INDEX_NAME}'...")
+    index = pc.Index(INDEX_NAME)
+
+    print("Worker initialization complete. Connected to Pinecone.")
     return redis_conn, openai_client, openrouter_client, index, INDEX_NAME
 
 # --- 2. HELPER FUNCTIONS ---
@@ -71,16 +80,13 @@ def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, red
         batch_chunks = chunks[i:i + batch_size]
         embeddings = get_embeddings(batch_chunks, openai_client)
         
-        # --- THIS IS THE NEW FIX ---
-        # Ensure vectors for upserting are ALSO float32 for consistency
         embeddings_float32 = np.array(embeddings, dtype=np.float32).tolist()
         
         vectors_to_upsert = []
-        # Use the converted embeddings here
         for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings_float32)):
             vectors_to_upsert.append({
                 "id": f"{document_id}-chunk-{i+j}", 
-                "values": embedding, # This is now consistently float32
+                "values": embedding,
                 "metadata": {"text": chunk_text, "document_id": document_id}
             })
         index.upsert(vectors=vectors_to_upsert)
@@ -139,9 +145,7 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
             job_id = job_data["job_id"]
             cancel_key = f"cancel:{job_id}"
 
-            if redis_conn.exists(cancel_key):
-                print(f"Job {job_id} was canceled before it began.")
-                continue
+            if redis_conn.exists(cancel_key): continue
 
             print(f"Processing job: {job_id}")
             document_url = job_data["document_url"]
@@ -154,16 +158,13 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
                     temp_pdf.write(response.content)
                     temp_pdf_path = temp_pdf.name
-                
                 process_and_index_pdf(temp_pdf_path, document_id, cancel_key, redis_conn, openai_client, index)
                 redis_conn.sadd(PROCESSED_DOCS_SET_KEY, document_id)
             
             question_embeddings = get_embeddings(questions, openai_client)
-            
             if redis_conn.exists(cancel_key): raise InterruptedError(f"Job {job_id} canceled.")
             
             all_context_chunks = find_most_similar_chunks_batch(question_embeddings, document_id, index)
-            
             if redis_conn.exists(cancel_key): raise InterruptedError(f"Job {job_id} canceled.")
 
             all_answers = get_llm_answers_concurrently(questions, all_context_chunks, openrouter_client)

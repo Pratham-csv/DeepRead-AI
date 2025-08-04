@@ -105,7 +105,20 @@ def find_most_similar_chunks(query_embedding: list[float], document_id: str, ind
 def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> str:
     # SOLUTION: This now uses the client passed as an argument, not a new one.
     context = "\n\n---\n\n".join(context_chunks)
-    prompt = f"""You are a precise assistant... (rest of your prompt)"""
+    prompt = f"""
+    You are a precise assistant for answering questions about an insurance policy.
+    Your answer MUST be based SOLELY on the context provided below.
+    CRITICAL INSTRUCTION: When answering, you must first look for any specific exclusions, waiting periods, or limitations related to the user's question. If an exclusion clause is present, it OVERRIDES any general definition.
+    
+    FORMATTING INSTRUCTION: Provide your final answer as a single, clean paragraph. Do not use bullet points, markdown, or any special formatting.
+
+    CONTEXT:
+    {context}
+    
+    QUESTION: {query}
+    
+    ANSWER:
+    """
     response = openrouter_client.chat.completions.create(
         model="mistralai/mistral-7b-instruct-v0.2", messages=[{"role": "user", "content": prompt}]
     )

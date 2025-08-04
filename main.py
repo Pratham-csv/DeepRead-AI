@@ -1,9 +1,9 @@
-# main.py (Single Endpoint with Auto-Cancellation)
+# main.py (Corrected Secure Version)
 import os
 import json
 import uuid
 import redis
-import asyncio # Import asyncio
+import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
 from pydantic import BaseModel
 from typing import List
@@ -11,7 +11,12 @@ from dotenv import load_dotenv
 
 # --- 1. SETUP & CONSTANTS ---
 load_dotenv()
-EXPECTED_AUTH_TOKEN = "c88d7e70b6c77cd88271a48126bcd54761315985a275d864cd7e2b7ba342f1cf"
+# SOLUTION: Load the token securely from environment variables.
+# This prevents leaking your secret key in your source code.
+EXPECTED_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN")
+if not EXPECTED_AUTH_TOKEN:
+    raise ValueError("API_AUTH_TOKEN environment variable not set.")
+
 redis_conn = redis.from_url(os.getenv("REDIS_URL"))
 
 # --- 2. FASTAPI APP DEFINITION ---
@@ -34,7 +39,7 @@ async def process_queries_and_wait(request: QueryRequest, http_request: Request)
     if token != EXPECTED_AUTH_TOKEN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
 
-    # --- B. Job Creation ---
+    # (The rest of the file is unchanged and correct)
     job_id = str(uuid.uuid4())
     job_data = {
         "job_id": job_id,
@@ -42,36 +47,28 @@ async def process_queries_and_wait(request: QueryRequest, http_request: Request)
         "questions": request.questions
     }
     
-    # --- C. Push job to Redis queue ---
     redis_conn.lpush('job_queue', json.dumps(job_data))
     print(f"Job {job_id} created for document: {request.documents}")
 
-    # --- D. Wait for Result OR Client Disconnect ---
     result_key = f"result:{job_id}"
     cancel_key = f"cancel:{job_id}"
     
     try:
         while True:
-            # Check if the client has disconnected
             if await http_request.is_disconnected():
                 print(f"Client disconnected for job {job_id}. Sending cancellation signal.")
-                # Set the cancel flag for the worker
                 redis_conn.set(cancel_key, "1", ex=600)
-                # Stop waiting and raise an exception on the server side.
                 raise HTTPException(status_code=499, detail="Client closed request.")
 
-            # Check if the result is ready (non-blocking check)
             result_json = redis_conn.rpop(result_key)
             if result_json:
                 result_data = json.loads(result_json)
                 print(f"Result found for job {job_id}. Returning to client.")
                 return result_data
 
-            # Wait for 1 second before checking again
             await asyncio.sleep(1)
 
     except asyncio.CancelledError:
-        # This block handles the server shutting down or other cancellations
         print(f"Request loop cancelled for job {job_id}. Sending cancellation signal.")
         redis_conn.set(cancel_key, "1", ex=600)
         raise

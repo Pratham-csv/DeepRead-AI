@@ -1,4 +1,4 @@
-# worker.py (Final Version with Robust Debugging)
+# worker.py (The True and Final Version)
 import os
 import sys
 import json
@@ -21,9 +21,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def initialize_services():
     print("Worker starting up...")
     load_dotenv()
-
-    # --- Validate and Configure API Clients ---
-    # (This section is robust and well-written)
+    
+    # Validate and Configure API Clients
     redis_url = os.getenv("REDIS_URL")
     if not redis_url: raise ValueError("[FATAL] REDIS_URL is not set!")
     redis_conn = redis.from_url(redis_url)
@@ -64,44 +63,80 @@ def initialize_services():
     index = pc.Index(host=host)
 
     print("Worker initialization complete.")
-    return redis_conn, openai_client, openrouter_client, index, INDEX_NAME
+    return redis_conn, openai_client, openrouter_client, index
 
-# --- 2. HELPER FUNCTIONS ---
-def is_valid_embedding(embedding, dim=1536):
-    # ... (Your excellent validation function - no changes needed)
-    return True # Placeholder, your logic is good
-
-def get_embeddings(texts: list[str], openai_client, dim=1536) -> list[list[float]]:
-    # ... (Your excellent embedding function - no changes needed)
+# --- 2. HELPER FUNCTIONS (Complete Versions) ---
+def get_embeddings(texts: list[str], openai_client) -> list[list[float]]:
+    texts = [text.replace("\n", " ") for text in texts]
     response = openai_client.embeddings.create(input=texts, model="text-embedding-3-small")
     return [e.embedding for e in response.data]
 
 def process_and_index_pdf(file_path: str, document_id: str, cancel_key: str, redis_conn, openai_client, index):
-    # ... (Your excellent indexing function - no changes needed)
-    pass # Placeholder, your logic is good
+    print(f"Starting indexing for document: {document_id}")
+    doc = fitz.open(file_path)
+    full_text = "".join(page.get_text() for page in doc)
+    print(f"Extracted {len(full_text)} characters from PDF.")
 
-def find_most_similar_chunks(query_embedding: list[float], document_id: str, index, dim=1536, top_k: int = 5) -> list[str]:
-    # ... (Your excellent diagnostic query function - no changes needed)
-    results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True, filter={"document_id": {"$eq": document_id}})
+    if not full_text.strip():
+        print(f"[ERROR] PDF text for {document_id} is empty. Skipping indexing.")
+        return
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+    chunks = text_splitter.split_text(full_text)
+    print(f"Split text into {len(chunks)} chunks.")
+    
+    batch_size = 100
+    for i in range(0, len(chunks), batch_size):
+        if redis_conn.exists(cancel_key):
+            raise InterruptedError(f"Job {document_id} canceled during indexing.")
+        
+        batch_chunks = chunks[i:i + batch_size]
+        print(f"Processing batch {i//batch_size + 1}, with {len(batch_chunks)} chunks.")
+        embeddings = get_embeddings(batch_chunks, openai_client)
+        
+        vectors_to_upsert = []
+        for j, (chunk_text, embedding) in enumerate(zip(batch_chunks, embeddings)):
+            vectors_to_upsert.append({
+                "id": f"{document_id}-chunk-{i+j}", 
+                "values": embedding,
+                "metadata": {"text": chunk_text, "document_id": document_id}
+            })
+        
+        if vectors_to_upsert:
+            print(f"Upserting {len(vectors_to_upsert)} vectors to Pinecone...")
+            index.upsert(vectors=vectors_to_upsert)
+
+    print(f"--- ✅ Finished indexing for {document_id} ---")
+
+def find_most_similar_chunks(query_embedding: list[float], document_id: str, index, top_k: int = 5) -> list[str]:
+    results = index.query(
+        vector=query_embedding, 
+        top_k=top_k, 
+        include_metadata=True, 
+        filter={"document_id": {"$eq": document_id}}
+    )
+    print(f"Found {len(results['matches'])} relevant chunks for query.")
     return [m['metadata']['text'] for m in results['matches']]
 
 def get_llm_answer(query: str, context_chunks: list[str], openrouter_client) -> str:
-    # ... (Your prompt and LLM call - no changes needed)
-    return "This is a test answer." # Placeholder
+    context = "\n\n---\n\n".join(context_chunks)
+    prompt = f"""You are a precise assistant... (your full prompt here)"""
+    response = openrouter_client.chat.completions.create(
+        model="mistralai/mistral-7b-instruct-v0.2", messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content.strip()
 
 # --- 3. WORKER LOOP ---
-def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_NAME, dim=1536):
+def main_worker_loop(redis_conn, openai_client, openrouter_client, index):
     PROCESSED_DOCS_SET_KEY = "processed_docs_v4"
     print(f"Worker started. Watching for jobs in Redis queue 'job_queue'...")
     while True:
         job_id, temp_pdf_path = None, None
         try:
-            # THIS IS THE "STUCK" POINT - IT'S WAITING FOR A JOB
             _, job_json = redis_conn.brpop('job_queue')
-            
             job_data = json.loads(job_json)
             job_id = job_data["job_id"]
-            print(f"--- Received job: {job_id} ---")
+            print(f"\n--- Received job: {job_id} ---")
             
             cancel_key = f"cancel:{job_id}"
             if redis_conn.exists(cancel_key):
@@ -109,11 +144,11 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
                 continue
 
             document_url = job_data["document_url"]
-            # TINY FIX: Corrected double underscore from document__id to document_id
             document_id = os.path.basename(document_url.split('?')[0])
             questions = job_data["questions"]
 
             if not redis_conn.sismember(PROCESSED_DOCS_SET_KEY, document_id):
+                print(f"Document '{document_id}' not found in cache. Starting processing.")
                 response = requests.get(document_url)
                 response.raise_for_status()
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
@@ -121,13 +156,17 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
                     temp_pdf_path = temp_pdf.name
                 process_and_index_pdf(temp_pdf_path, document_id, cancel_key, redis_conn, openai_client, index)
                 redis_conn.sadd(PROCESSED_DOCS_SET_KEY, document_id)
+                print(f"Document '{document_id}' marked as processed in Redis.")
+            else:
+                print(f"Document '{document_id}' found in cache. Skipping indexing.")
             
-            question_embeddings = get_embeddings(questions, openai_client, dim)
+            print(f"Generating embeddings for {len(questions)} questions...")
+            question_embeddings = get_embeddings(questions, openai_client)
             
             all_answers = []
-            for i, question in enumerate(questions):
-                query_embedding = question_embeddings[i]
-                context_chunks = find_most_similar_chunks(query_embedding, document_id, index, dim)
+            for i, (question, query_embedding) in enumerate(zip(questions, question_embeddings)):
+                print(f"Processing question {i+1}/{len(questions)}...")
+                context_chunks = find_most_similar_chunks(query_embedding, document_id, index)
                 answer = get_llm_answer(question, context_chunks, openrouter_client) if context_chunks else "Could not find relevant information."
                 all_answers.append(answer)
 
@@ -137,7 +176,7 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
             print(f"--- Finished job: {job_id} ---")
         
         except Exception as e:
-            print(f"[ERROR] Error processing job {job_id}: {e}")
+            print(f"[ERROR] An exception occurred in the main loop for job {job_id}: {e}")
             traceback.print_exc()
             if job_id:
                 error_response = {"answers": [f"An error occurred: {str(e)}"]}
@@ -148,9 +187,9 @@ def main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_
 
 if __name__ == "__main__":
     try:
-        redis_conn, openai_client, openrouter_client, index, INDEX_NAME = initialize_services()
-        main_worker_loop(redis_conn, openai_client, openrouter_client, index, INDEX_NAME)
+        redis_conn, openai_client, openrouter_client, index = initialize_services()
+        main_worker_loop(redis_conn, openai_client, openrouter_client, index)
     except Exception as e:
-        print(f"[FATAL] Worker failed to start. Error: {e}")
+        print(f"[FATAL] Worker failed to start: {e}")
         traceback.print_exc()
         sys.exit(1)
